@@ -60,6 +60,7 @@ struct RelocateData {
 	    randomId(deterministicRandom()->randomUniqueID()), workFactor(0),
 	    wantsNewServers(rs.priority == SERVER_KNOBS->PRIORITY_REBALANCE_OVERUTILIZED_TEAM ||
 	                    rs.priority == SERVER_KNOBS->PRIORITY_REBALANCE_UNDERUTILIZED_TEAM ||
+	                    rs.priority == SERVER_KNOBS->PRIORITY_REBALANCE_TEAM ||
 	                    rs.priority == SERVER_KNOBS->PRIORITY_SPLIT_SHARD ||
 	                    rs.priority == SERVER_KNOBS->PRIORITY_TEAM_REDUNDANT),
 	    interval("QueuedRelocation") {}
@@ -1354,6 +1355,101 @@ ACTOR Future<bool> rebalanceTeams(DDQueueData* self,
 	return false;
 }
 
+// <source, dest>
+using TeamPair = Optional<std::pair<Reference<IDataDistributionTeam>, Reference<IDataDistributionTeam>>>;
+
+ACTOR Future<Void> BgDDEqualizer(DDQueueData* self, int teamCollectionIndex) {
+	state double rebalancePollingInterval = SERVER_KNOBS->BG_REBALANCE_POLLING_INTERVAL;
+	state int resetCount = SERVER_KNOBS->DD_REBALANCE_RESET_AMOUNT;
+	state Transaction tr(self->cx);
+	state double lastRead = 0;
+	state bool skipCurrentLoop = false;
+	loop {
+		state TeamPair toBalance;
+		state bool moved = false;
+		state TraceEvent traceEvent("BgDDEqualizer", self->distributorId);
+		traceEvent.suppressFor(5.0).detail("PollingInterval", rebalancePollingInterval);
+
+		if (*self->lastLimited > 0) {
+			traceEvent.detail("SecondsSinceLastLimited", now() - *self->lastLimited);
+		}
+
+		try {
+			state Future<Void> delayF = delay(rebalancePollingInterval, TaskPriority::DataDistributionLaunch);
+			if ((now() - lastRead) > SERVER_KNOBS->BG_REBALANCE_SWITCH_CHECK_INTERVAL) {
+				tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+				Optional<Value> val = wait(tr.get(rebalanceDDIgnoreKey));
+				lastRead = now();
+				if (skipCurrentLoop && !val.present()) {
+					// reset loop interval
+					rebalancePollingInterval = SERVER_KNOBS->BG_REBALANCE_POLLING_INTERVAL;
+				}
+				skipCurrentLoop = val.present();
+			}
+
+			traceEvent.detail("Enabled", !skipCurrentLoop);
+
+			wait(delayF);
+			if (skipCurrentLoop) {
+				// set loop interval to avoid busy wait here.
+				rebalancePollingInterval =
+				    std::max(rebalancePollingInterval, SERVER_KNOBS->BG_REBALANCE_SWITCH_CHECK_INTERVAL);
+				continue;
+			}
+
+			traceEvent.detail("QueuedRelocations", self->priority_relocations[SERVER_KNOBS->PRIORITY_REBALANCE_TEAM]);
+			if (self->priority_relocations[SERVER_KNOBS->PRIORITY_REBALANCE_TEAM] <
+			    SERVER_KNOBS->DD_REBALANCE_PARALLELISM * 2) {
+				TeamPair _toBalance = wait(brokenPromiseToNever(
+				    self->teamCollections[teamCollectionIndex].getTeamsToBalance.getReply(GetTeamsToBalanceRequest())));
+				if (_toBalance.present()) {
+					toBalance = _toBalance;
+
+					traceEvent.detail("SourceTeam", printable(toBalance.get().first->getDesc()));
+					traceEvent.detail("DestTeam", printable(toBalance.get().second->getDesc()));
+
+					bool _moved = wait(rebalanceTeams(self,
+					                                  SERVER_KNOBS->PRIORITY_REBALANCE_TEAM,
+					                                  toBalance.get().first,
+					                                  toBalance.get().second,
+					                                  teamCollectionIndex == 0,
+					                                  &traceEvent));
+					moved = _moved;
+					if (moved) {
+						resetCount = 0;
+					} else {
+						resetCount++;
+					}
+				}
+			}
+
+			if (now() - (*self->lastLimited) < SERVER_KNOBS->BG_DD_SATURATION_DELAY) {
+				rebalancePollingInterval = std::min(SERVER_KNOBS->BG_DD_MAX_WAIT,
+				                                    rebalancePollingInterval * SERVER_KNOBS->BG_DD_INCREASE_RATE);
+			} else {
+				rebalancePollingInterval = std::max(SERVER_KNOBS->BG_DD_MIN_WAIT,
+				                                    rebalancePollingInterval / SERVER_KNOBS->BG_DD_DECREASE_RATE);
+			}
+
+			if (resetCount >= SERVER_KNOBS->DD_REBALANCE_RESET_AMOUNT &&
+			    rebalancePollingInterval < SERVER_KNOBS->BG_REBALANCE_POLLING_INTERVAL) {
+				rebalancePollingInterval = SERVER_KNOBS->BG_REBALANCE_POLLING_INTERVAL;
+				resetCount = SERVER_KNOBS->DD_REBALANCE_RESET_AMOUNT;
+			}
+
+			traceEvent.detail("ResetCount", resetCount);
+			tr.reset();
+		} catch (Error& e) {
+			traceEvent.error(
+			    e, true); // Log actor_cancelled because it's not legal to suppress an event that's initialized
+			wait(tr.onError(e));
+		}
+
+		traceEvent.detail("Moved", moved);
+		traceEvent.log();
+	}
+}
+
 ACTOR Future<Void> BgDDMountainChopper(DDQueueData* self, int teamCollectionIndex) {
 	state double rebalancePollingInterval = SERVER_KNOBS->BG_REBALANCE_POLLING_INTERVAL;
 	state int resetCount = SERVER_KNOBS->DD_REBALANCE_RESET_AMOUNT;
@@ -1605,8 +1701,9 @@ ACTOR Future<Void> dataDistributionQueue(Database cx,
 	state Future<Void> launchQueuedWorkTimeout = Never();
 
 	for (int i = 0; i < teamCollections.size(); i++) {
-		balancingFutures.push_back(BgDDMountainChopper(&self, i));
-		balancingFutures.push_back(BgDDValleyFiller(&self, i));
+		// balancingFutures.push_back(BgDDMountainChopper(&self, i));
+		// balancingFutures.push_back(BgDDValleyFiller(&self, i));
+		balancingFutures.push_back(BgDDEqualizer(&self, i));
 	}
 	balancingFutures.push_back(delayedAsyncVar(self.rawProcessingUnhealthy, processingUnhealthy, 0));
 	balancingFutures.push_back(delayedAsyncVar(self.rawProcessingWiggle, processingWiggle, 0));
@@ -1688,6 +1785,8 @@ ACTOR Future<Void> dataDistributionQueue(Database cx,
 					            self.priority_relocations[SERVER_KNOBS->PRIORITY_REBALANCE_UNDERUTILIZED_TEAM])
 					    .detail("PriorityRebalanceOverutilizedTeam",
 					            self.priority_relocations[SERVER_KNOBS->PRIORITY_REBALANCE_OVERUTILIZED_TEAM])
+					    .detail("PriorityRebalanceTeam",
+					            self.priority_relocations[SERVER_KNOBS->PRIORITY_REBALANCE_TEAM])
 					    .detail("PriorityStorageWiggle",
 					            self.priority_relocations[SERVER_KNOBS->PRIORITY_PERPETUAL_STORAGE_WIGGLE])
 					    .detail("PriorityTeamHealthy", self.priority_relocations[SERVER_KNOBS->PRIORITY_TEAM_HEALTHY])

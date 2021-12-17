@@ -18,6 +18,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <set>
 #include <sstream>
 #include "fdbclient/FDBOptions.g.h"
@@ -40,6 +41,7 @@
 #include "fdbserver/WaitFailure.h"
 #include "flow/ActorCollection.h"
 #include "flow/Arena.h"
+#include "flow/IRandom.h"
 #include "flow/Trace.h"
 #include "flow/UnitTest.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
@@ -689,7 +691,10 @@ struct DDTeamCollection : ReferenceCounted<DDTeamCollection> {
 	AsyncVar<Optional<Key>> healthyZone;
 	Future<bool> clearHealthyZoneFuture;
 	double medianAvailableSpace;
+	double ssLowAvailableSpaceThreshold;
+	double ssHighAvailableSpaceThreshold;
 	double lastMedianAvailableSpaceUpdate;
+	Future<Void> medianUpdater;
 	// clang-format on
 
 	int lowestUtilizationTeam;
@@ -759,7 +764,7 @@ struct DDTeamCollection : ReferenceCounted<DDTeamCollection> {
 	    zeroHealthyTeams(zeroHealthyTeams), zeroOptimalTeams(true), primary(primary), isTssRecruiting(false),
 	    medianAvailableSpace(SERVER_KNOBS->MIN_AVAILABLE_SPACE_RATIO), lastMedianAvailableSpaceUpdate(0),
 	    processingUnhealthy(processingUnhealthy), lowestUtilizationTeam(0), highestUtilizationTeam(0),
-	    getShardMetrics(getShardMetrics), removeFailedServer(removeFailedServer),
+	    getShardMetrics(getShardMetrics), removeFailedServer(removeFailedServer), medianUpdater(Future<Void>(Void())),
 	    getUnhealthyRelocationCount(getUnhealthyRelocationCount),
 	    ddTrackerStartingEventHolder(makeReference<EventCacheHolder>("DDTrackerStarting")),
 	    teamCollectionInfoEventHolder(makeReference<EventCacheHolder>("TeamCollectionInfo")),
@@ -882,39 +887,209 @@ struct DDTeamCollection : ReferenceCounted<DDTeamCollection> {
 		return Void();
 	}
 
+	ACTOR static Future<Void> updateMedianAvailableSpace(DDTeamCollection* self) {
+		self->lastMedianAvailableSpaceUpdate = now();
+		std::vector<double> teamAvailableSpace;
+		teamAvailableSpace.reserve(self->teams.size());
+		for (const auto& team : self->teams) {
+			if (team->isHealthy()) {
+				teamAvailableSpace.push_back(team->getMinAvailableSpaceRatio());
+			}
+		}
+
+		size_t pivot = teamAvailableSpace.size() / 2;
+		if (teamAvailableSpace.size() > 1) {
+			std::nth_element(teamAvailableSpace.begin(), teamAvailableSpace.begin() + pivot, teamAvailableSpace.end());
+			self->medianAvailableSpace =
+			    std::max(SERVER_KNOBS->MIN_AVAILABLE_SPACE_RATIO,
+			             std::min(SERVER_KNOBS->TARGET_AVAILABLE_SPACE_RATIO, teamAvailableSpace[pivot]));
+		} else {
+			self->medianAvailableSpace = SERVER_KNOBS->MIN_AVAILABLE_SPACE_RATIO;
+		}
+		if (self->medianAvailableSpace < SERVER_KNOBS->TARGET_AVAILABLE_SPACE_RATIO) {
+			TraceEvent(SevWarn, "DDTeamMedianAvailableSpaceTooSmall", self->distributorId)
+			    .detail("MedianAvailableSpaceRatio", self->medianAvailableSpace)
+			    .detail("TargetAvailableSpaceRatio", SERVER_KNOBS->TARGET_AVAILABLE_SPACE_RATIO)
+			    .detail("Primary", self->primary);
+			self->printDetailedTeamsInfo.trigger();
+		}
+
+		// also do for SS
+		std::vector<double> serverAvailableSpace;
+		for (const auto& ss : self->server_info) {
+			if (ss.second->serverMetrics.present()) {
+				auto replyValue = ss.second->serverMetrics.get();
+				int64_t bytesAvailable = replyValue.available.bytes;
+
+				double ratio = 0.0;
+				if (replyValue.capacity.bytes != 0)
+					ratio = ((double)bytesAvailable) / replyValue.capacity.bytes;
+				serverAvailableSpace.push_back(ratio);
+			}
+		}
+
+		// TODO need to only do healthy servers
+		pivot = serverAvailableSpace.size() / 2;
+		if (serverAvailableSpace.size() > 1) {
+			// TODO this can be optimized with at most 2 nth element calls
+			std::sort(serverAvailableSpace.begin(), serverAvailableSpace.end());
+			// handle small server sizes specially
+			if (serverAvailableSpace.size() < 5) {
+				int mid = serverAvailableSpace.size() / 2;
+				if (serverAvailableSpace.size() % 2 == 0) {
+					self->ssLowAvailableSpaceThreshold =
+					    (serverAvailableSpace[mid] + serverAvailableSpace[mid - 1]) / 2.0;
+				} else {
+					self->ssLowAvailableSpaceThreshold = serverAvailableSpace[mid];
+				}
+				self->ssHighAvailableSpaceThreshold = self->ssLowAvailableSpaceThreshold;
+				self->ssLowAvailableSpaceThreshold -= 0.01;
+				self->ssHighAvailableSpaceThreshold += 0.01;
+			} else {
+				int edgeSize = (int)(sqrt(serverAvailableSpace.size()));
+				self->ssLowAvailableSpaceThreshold = serverAvailableSpace[edgeSize] - 0.01;
+				self->ssHighAvailableSpaceThreshold =
+				    serverAvailableSpace[serverAvailableSpace.size() - edgeSize - 1] + 0.01;
+			}
+		} else {
+			self->ssLowAvailableSpaceThreshold = SERVER_KNOBS->MIN_AVAILABLE_SPACE_RATIO;
+		}
+
+		return Void();
+	}
+
+	// TODO should be static
+	UID selectWeightedCandidate(std::vector<std::pair<double, UID>>& candidates, bool reverse) {
+		size_t firstN = 1;
+		while (firstN <= candidates.size() && deterministicRandom()->random01() < 0.7) {
+			firstN *= 2;
+		}
+		firstN = std::min(firstN, candidates.size());
+
+		size_t idx = deterministicRandom()->randomInt(0, firstN);
+		if (reverse) {
+			idx = candidates.size() - idx - 1;
+		}
+		std::nth_element(candidates.begin(), candidates.begin() + idx, candidates.end());
+		return candidates[idx].second;
+	}
+
+	ACTOR static Future<Void> getTeamsToBalance(DDTeamCollection* self, GetTeamsToBalanceRequest req) {
+		// printf("GetTeamsToBalance\n");
+		try {
+			wait(self->checkBuildTeams(self));
+			// printf("GetTeamsToBalance got teams\n");
+			if (now() - self->lastMedianAvailableSpaceUpdate > SERVER_KNOBS->AVAILABLE_SPACE_UPDATE_DELAY &&
+			    self->medianUpdater.isReady()) {
+				self->medianUpdater = updateMedianAvailableSpace(self);
+			}
+			wait(self->medianUpdater);
+			// printf("GetTeamsToBalance median updated\n");
+
+			std::vector<std::pair<double, UID>> lowCandidates;
+			std::vector<std::pair<double, UID>> highCandidates;
+
+			// TODO need to do only healthy servers somehow or this can fail regularly
+			for (const auto& ss : self->server_info) {
+				if (ss.second->serverMetrics.present() && ss.second) {
+					auto replyValue = ss.second->serverMetrics.get();
+					int64_t bytesAvailable = replyValue.available.bytes;
+					bytesAvailable = std::max((int64_t)0, bytesAvailable - ss.second->dataInFlightToServer);
+
+					double ratio = 0.0;
+					if (replyValue.capacity.bytes != 0)
+						ratio = ((double)bytesAvailable) / replyValue.capacity.bytes;
+
+					if (ratio <= self->ssLowAvailableSpaceThreshold) {
+						lowCandidates.push_back(std::pair(ratio, ss.first));
+					} else if (ratio > self->ssHighAvailableSpaceThreshold &&
+					           bytesAvailable > SERVER_KNOBS->MIN_AVAILABLE_SPACE) {
+						highCandidates.push_back(std::pair(ratio, ss.first));
+					}
+				}
+			}
+
+			// TODO REMOVE
+			// printf("%lu low and %lu high candidates\n", lowCandidates.size(), highCandidates.size());
+			if (lowCandidates.empty() || highCandidates.empty()) {
+				req.reply.send(
+				    Optional<std::pair<Reference<IDataDistributionTeam>, Reference<IDataDistributionTeam>>>());
+				return Void();
+			}
+
+			UID lowCandidate = self->selectWeightedCandidate(lowCandidates, false);
+			UID highCandidate = self->selectWeightedCandidate(highCandidates, true);
+
+			int64_t bestLowLoadBytes = 0;
+			int64_t bestHighLoadBytes = 0;
+			Optional<Reference<TCTeamInfo>> lowTeam;
+			Optional<Reference<TCTeamInfo>> highTeam;
+
+			// TODO optimize
+			for (int i = 0; i < self->teams.size(); i++) {
+				if (!self->teams[i]->isHealthy()) {
+					continue;
+				}
+				bool hasLow = false;
+				bool hasHigh = false;
+				for (auto& id : self->teams[i]->getServerIDs()) {
+					if (id == lowCandidate) {
+						hasLow = true;
+					}
+					if (id == highCandidate) {
+						hasHigh = true;
+					}
+				}
+
+				if (hasLow == hasHigh) {
+					continue;
+				}
+				int64_t loadBytes = self->teams[i]->getLoadBytes(true, 1.0);
+				// if this team has our lowest available space, and it's healthy and has shards, we can move stuff away
+				// from it
+				if (hasLow && self->shardsAffectedByTeamFailure->hasShards(
+				                  ShardsAffectedByTeamFailure::Team(self->teams[i]->getServerIDs(), self->primary))) {
+					if (!lowTeam.present() || loadBytes > bestLowLoadBytes) {
+						bestLowLoadBytes = loadBytes;
+						lowTeam = self->teams[i];
+					}
+				}
+				// we want to move to a team that has high available space that has our high available space candidate
+				if (hasHigh && self->teams[i]->hasHealthyAvailableSpace(self->medianAvailableSpace)) {
+					if (!highTeam.present() || loadBytes < bestHighLoadBytes) {
+						bestHighLoadBytes = loadBytes;
+						highTeam = self->teams[i];
+					}
+				}
+			}
+
+			if (lowTeam.present() && highTeam.present()) {
+				// printf("Found 2 teams to rebalance! %lld -> %lld\n", bestLowLoadBytes, bestHighLoadBytes);
+				req.reply.send(std::make_pair(lowTeam.get(), highTeam.get()));
+			} else {
+				// printf("Couldn't find teams to rebalance\n");
+				req.reply.send(
+				    Optional<std::pair<Reference<IDataDistributionTeam>, Reference<IDataDistributionTeam>>>());
+			}
+
+			return Void();
+		} catch (Error& e) {
+			if (e.code() != error_code_actor_cancelled)
+				req.reply.sendError(e);
+			throw;
+		}
+	}
+
 	// SOMEDAY: Make bestTeam better about deciding to leave a shard where it is (e.g. in PRIORITY_TEAM_HEALTHY case)
 	//		    use keys, src, dest, metrics, priority, system load, etc.. to decide...
 	ACTOR static Future<Void> getTeam(DDTeamCollection* self, GetTeamRequest req) {
 		try {
 			wait(self->checkBuildTeams(self));
-			if (now() - self->lastMedianAvailableSpaceUpdate > SERVER_KNOBS->AVAILABLE_SPACE_UPDATE_DELAY) {
-				self->lastMedianAvailableSpaceUpdate = now();
-				std::vector<double> teamAvailableSpace;
-				teamAvailableSpace.reserve(self->teams.size());
-				for (const auto& team : self->teams) {
-					if (team->isHealthy()) {
-						teamAvailableSpace.push_back(team->getMinAvailableSpaceRatio());
-					}
-				}
-
-				size_t pivot = teamAvailableSpace.size() / 2;
-				if (teamAvailableSpace.size() > 1) {
-					std::nth_element(
-					    teamAvailableSpace.begin(), teamAvailableSpace.begin() + pivot, teamAvailableSpace.end());
-					self->medianAvailableSpace =
-					    std::max(SERVER_KNOBS->MIN_AVAILABLE_SPACE_RATIO,
-					             std::min(SERVER_KNOBS->TARGET_AVAILABLE_SPACE_RATIO, teamAvailableSpace[pivot]));
-				} else {
-					self->medianAvailableSpace = SERVER_KNOBS->MIN_AVAILABLE_SPACE_RATIO;
-				}
-				if (self->medianAvailableSpace < SERVER_KNOBS->TARGET_AVAILABLE_SPACE_RATIO) {
-					TraceEvent(SevWarn, "DDTeamMedianAvailableSpaceTooSmall", self->distributorId)
-					    .detail("MedianAvailableSpaceRatio", self->medianAvailableSpace)
-					    .detail("TargetAvailableSpaceRatio", SERVER_KNOBS->TARGET_AVAILABLE_SPACE_RATIO)
-					    .detail("Primary", self->primary);
-					self->printDetailedTeamsInfo.trigger();
-				}
+			if (now() - self->lastMedianAvailableSpaceUpdate > SERVER_KNOBS->AVAILABLE_SPACE_UPDATE_DELAY &&
+			    self->medianUpdater.isReady()) {
+				self->medianUpdater = updateMedianAvailableSpace(self);
 			}
+			wait(self->medianUpdater);
 
 			bool foundSrc = false;
 			for (int i = 0; i < req.src.size(); i++) {
@@ -5589,6 +5764,13 @@ ACTOR Future<Void> serverGetTeamRequests(TeamCollectionInterface tci, DDTeamColl
 	}
 }
 
+ACTOR Future<Void> serverGetTeamsToBalanceRequests(TeamCollectionInterface tci, DDTeamCollection* self) {
+	loop {
+		GetTeamsToBalanceRequest req = waitNext(tci.getTeamsToBalance.getFuture());
+		self->addActor.send(self->getTeamsToBalance(self, req));
+	}
+}
+
 ACTOR Future<Void> remoteRecovered(Reference<AsyncVar<struct ServerDBInfo>> db) {
 	TraceEvent("DDTrackerStarting");
 	while (db->get().recoveryState < RecoveryState::ALL_LOGS_RECRUITED) {
@@ -5626,6 +5808,7 @@ ACTOR Future<Void> dataDistributionTeamCollection(Reference<DDTeamCollection> te
 		wait(DDTeamCollection::init(self, initData, ddEnabledState));
 		initData = Reference<InitialDataDistribution>();
 		self->addActor.send(serverGetTeamRequests(tci, self));
+		self->addActor.send(serverGetTeamsToBalanceRequests(tci, self));
 
 		TraceEvent("DDTeamCollectionBegin", self->distributorId).detail("Primary", self->primary);
 		wait(self->readyToStart || error);

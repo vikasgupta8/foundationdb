@@ -73,6 +73,11 @@ struct IDataDistributionTeam {
 	}
 };
 
+struct GetTeamsToBalanceRequest {
+	GetTeamsToBalanceRequest() {}
+	Promise<Optional<std::pair<Reference<IDataDistributionTeam>, Reference<IDataDistributionTeam>>>> reply;
+};
+
 struct GetTeamRequest {
 	bool wantsNewServers;
 	bool wantsTrueBest;
@@ -126,6 +131,7 @@ struct GetMetricsListRequest {
 
 struct TeamCollectionInterface {
 	PromiseStream<GetTeamRequest> getTeam;
+	PromiseStream<GetTeamsToBalanceRequest> getTeamsToBalance;
 };
 
 class ShardsAffectedByTeamFailure : public ReferenceCounted<ShardsAffectedByTeamFailure> {
