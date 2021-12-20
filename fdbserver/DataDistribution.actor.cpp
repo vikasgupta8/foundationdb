@@ -1063,7 +1063,7 @@ struct DDTeamCollection : ReferenceCounted<DDTeamCollection> {
 				}
 			}
 
-			if (lowTeam.present() && highTeam.present()) {
+			if (lowTeam.present() && highTeam.present() && bestLowLoadBytes > bestHighLoadBytes) {
 				// printf("Found 2 teams to rebalance! %lld -> %lld\n", bestLowLoadBytes, bestHighLoadBytes);
 				req.reply.send(std::make_pair(lowTeam.get(), highTeam.get()));
 			} else {
